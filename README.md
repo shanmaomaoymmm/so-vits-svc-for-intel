@@ -603,6 +603,60 @@ python onnx_export.py -n <模型文件夹名>
 
 > 注意：本项目使用 [`onnx_export.py`](onnx_export.py) 导出（支持说话人混合），不是 `export_onnx.py`。
 
+### 完整导出（编码器 / 声码器 / F0，用于跨机器部署）
+
+`onnx_export.py` 只导出 SoVits 主体。若要在**没有 PyTorch 环境**的机器上推理，还需导出内容编码器、
+声码器与 F0 预测器。以下脚本会把它们一并导出，并汇总为自包含推理包：
+
+```bash
+# 1) 主模型（MoeVoiceStudio 用，7 输入）—— 需先把权重/配置放入 checkpoints/<模型文件夹名>/
+python onnx_export.py -n <模型文件夹名>
+
+# 2) 内容编码器 ContentVec768L12（用 fairseq 原始模型子链路导出，与推理数值完全一致）
+python tools/export_onnx_encoder.py --out checkpoints/onnx_bundle/vec768l12.onnx
+
+# 3) F0 预测器 RMVPE（附带 log-mel 滤波器组常量）
+python tools/export_onnx_rmvpe.py --out checkpoints/onnx_bundle/rmvpe.onnx
+
+# 4) 声码器 NSF-HiFiGAN（激励随机量外置，保证可复现）
+python tools/export_onnx_vocoder.py --out checkpoints/onnx_bundle/nsf_hifigan.onnx
+
+# 5) SoVits 随机外置版（修复导出图随机被固化、以及直流/次声问题）
+python tools/export_onnx_sovits_hifi.py \
+    --pth checkpoints/<模型文件夹名>/model.pth \
+    --config checkpoints/<模型文件夹名>/config.json \
+    --out checkpoints/onnx_bundle/SoVits.onnx
+
+# 6) 浅层扩散（已训练扩散模型时；导出后把 4 个 onnx 放入 bundle 的 diffusion/ 目录）
+python diffusion/onnx_export.py --project-name <扩散模型名> \
+    --model-path logs/44k/diffusion/model_188000.pt \
+    --out-dir checkpoints/huawu_diff_188000
+
+# 7) 汇总常量与配置（mel 滤波器组 / 重采样卷积核 / 扩散系数 / config.json）
+python tools/make_onnx_bundle.py
+```
+
+导出结果位于 `checkpoints/onnx_bundle/`，目标机只需三个依赖：
+
+```bash
+pip install onnxruntime numpy soundfile
+cd checkpoints/onnx_bundle
+python infer.py -i input.wav -o output.wav                      # 主模型
+python infer.py -i input.wav -o output.wav --shallow-diffusion  # + 浅层扩散
+```
+
+> 输入需为 44.1kHz；`--chunk 30` 长音频切片、`-t 2` 变调、`--seed` 固定随机、
+> `--highpass 20` 输出高通（默认开启，去除直流/次声）。
+
+数值对齐校验（需在 PyTorch 环境所在机器运行，逐组件比对编码器/F0/扩散/声码器/SoVits）：
+
+```bash
+python tools/verify_onnx_bundle.py
+```
+
+详细文件清单、输入输出规格与已知差异见 [`checkpoints/onnx_bundle/README.md`](checkpoints/onnx_bundle/README.md)，
+选型与导出报告见 [`doc/model_selection_report.md`](doc/model_selection_report.md)。
+
 ## ⚙️ XPU设备训练建议
 
 > ⚠️ **重要：当前建议使用 FP32 训练**
@@ -1272,6 +1326,61 @@ python onnx_export.py -n <model_folder_name>
 After exporting, `<model_folder_name>_SoVits.onnx` will be generated under `checkpoints/<model_folder_name>/`, and the corresponding MoeVS config `<model_folder_name>.json` under `checkpoints/`.
 
 > Note: This project uses [`onnx_export.py`](onnx_export.py) to export (with speaker-mix support), not `export_onnx.py`.
+
+### Full export (encoder / vocoder / F0) for cross-machine deployment
+
+`onnx_export.py` exports only the SoVits body. To run inference on a machine **without a PyTorch
+environment**, the content encoder, vocoder and F0 predictor must be exported as well. The scripts
+below export all of them and assemble a self-contained inference bundle:
+
+```bash
+# 1) main model (for MoeVoiceStudio, 7 inputs) — put model.pth/config.json into checkpoints/<name>/ first
+python onnx_export.py -n <model_folder_name>
+
+# 2) content encoder ContentVec768L12 (exported from the original fairseq sub-graph)
+python tools/export_onnx_encoder.py --out checkpoints/onnx_bundle/vec768l12.onnx
+
+# 3) F0 predictor RMVPE (+ log-mel filterbank constants)
+python tools/export_onnx_rmvpe.py --out checkpoints/onnx_bundle/rmvpe.onnx
+
+# 4) vocoder NSF-HiFiGAN (excitation randomness externalized for reproducibility)
+python tools/export_onnx_vocoder.py --out checkpoints/onnx_bundle/nsf_hifigan.onnx
+
+# 5) SoVits, externalized-random build (fixes trace-frozen randomness and DC/subsonic artifacts)
+python tools/export_onnx_sovits_hifi.py \
+    --pth checkpoints/<model_folder_name>/model.pth \
+    --config checkpoints/<model_folder_name>/config.json \
+    --out checkpoints/onnx_bundle/SoVits.onnx
+
+# 6) shallow diffusion (if trained; then copy the 4 onnx files into bundle/diffusion/)
+python diffusion/onnx_export.py --project-name <diffusion_name> \
+    --model-path logs/44k/diffusion/model_188000.pt --out-dir checkpoints/huawu_diff_188000
+
+# 7) collect constants and config (mel filterbanks / resample kernels / diffusion coefficients)
+python tools/make_onnx_bundle.py
+```
+
+The bundle is written to `checkpoints/onnx_bundle/`; the target machine only needs three packages:
+
+```bash
+pip install onnxruntime numpy soundfile
+cd checkpoints/onnx_bundle
+python infer.py -i input.wav -o output.wav                      # main model
+python infer.py -i input.wav -o output.wav --shallow-diffusion  # + shallow diffusion
+```
+
+> 44.1 kHz input is required; `--chunk 30` for long audio, `-t 2` pitch shift, `--seed` for
+> reproducibility, `--highpass 20` output high-pass (enabled by default to remove DC/subsonic).
+
+Numerical parity check (run on the machine that has the PyTorch environment; compares encoder / F0 /
+diffusion / vocoder / SoVits component by component):
+
+```bash
+python tools/verify_onnx_bundle.py
+```
+
+See [`checkpoints/onnx_bundle/README.md`](checkpoints/onnx_bundle/README.md) for the file list,
+I/O specs and known differences.
 
 ## ⚙️ XPU Device Training Recommendations
 
