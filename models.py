@@ -401,6 +401,7 @@ class SynthesizerTrn(nn.Module):
                  n_flow_layer = 4,
                  n_layers_trans_flow = 3,
                  use_transformer_flow = False,
+                 harmonic_num = 16,
                  **kwargs):
 
         super().__init__()
@@ -450,7 +451,8 @@ class SynthesizerTrn(nn.Module):
             "upsample_initial_channel": upsample_initial_channel,
             "upsample_kernel_sizes": upsample_kernel_sizes,
             "gin_channels": gin_channels,
-            "use_depthwise_conv":use_depthwise_conv
+            "use_depthwise_conv":use_depthwise_conv,
+            "harmonic_num": harmonic_num
         }
         
         modules.set_Conv1dModel(self.use_depthwise_conv)

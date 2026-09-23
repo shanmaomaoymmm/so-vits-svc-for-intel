@@ -318,7 +318,11 @@ class GaussianDiffusion(nn.Module):
 
         if len(noise_list) == 0:
             x_pred = get_x_pred(x, noise_pred, t)
-            noise_pred_prev = self.denoise_fn(x_pred, max(t - interval, 0), cond=cond)
+            # 注意: 这里必须使用 torch.clamp 而非 Python 内建 max。
+            # 当 t - interval < 0 时 max(tensor, 0) 会返回 Python int 0，
+            # 导致 denoise_fn 收到 int 而非 LongTensor（.float() 报错）。
+            noise_pred_prev = self.denoise_fn(
+                x_pred, torch.clamp(t - interval, min=0), cond=cond)
             noise_pred_prime = (noise_pred + noise_pred_prev) / 2
         elif len(noise_list) == 1:
             noise_pred_prime = (3 * noise_pred - noise_list[-1]) / 2
@@ -508,7 +512,8 @@ class GaussianDiffusion(nn.Module):
                     "noise": [3],
                     "condition": [2]
                 },
-                opset_version=16
+                opset_version=16,
+                dynamo=False,
             )
 
         for t in step_range:
@@ -528,7 +533,8 @@ class GaussianDiffusion(nn.Module):
                             "noise": [3],
                             "noise_pred": [3]
                         },
-                        opset_version=16
+                        opset_version=16,
+                        dynamo=False,
                     )
 
                 x_pred = self.get_x_pred(x, noise_pred, t_1, t_prev)
@@ -564,7 +570,8 @@ class GaussianDiffusion(nn.Module):
                 dynamic_axes={
                     "x": [3]
                 },
-                opset_version=16
+                opset_version=16,
+                dynamo=False,
             )
         x = self.ad(x)
 

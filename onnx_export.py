@@ -109,7 +109,10 @@ def OnnxExport(path=None):
         opset_version=16,
         verbose=False,
         input_names=input_names,
-        output_names=output_names
+        output_names=output_names,
+        # torch>=2.6 默认启用 dynamo 导出器（需要 onnxscript）；此处沿用
+        # 传统的 TorchScript 导出器，以兼容 dynamic_axes / do_constant_folding。
+        dynamo=False,
     )
 
     vec_lay = "layer-12" if SVCVITS.gin_channels == 768 else "layer-9"

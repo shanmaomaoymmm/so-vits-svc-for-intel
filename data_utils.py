@@ -110,9 +110,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             self.hparams.data.win_length,
             center=False)[0]
 
-        if spec.shape[1] > 800:
-            start = random.randint(0, spec.shape[1]-800)
-            end = start + 790
+        max_len = self.spec_len
+        if spec.shape[1] > max_len:
+            start = random.randint(0, spec.shape[1] - max_len)
+            end = start + max_len - 10
             spec, c, f0, uv = spec[:, start:end], c[:, start:end], f0[start:end], uv[start:end]
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
             if volume is not None:

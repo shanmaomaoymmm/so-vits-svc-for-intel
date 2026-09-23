@@ -47,15 +47,19 @@ except ImportError:
 # 📋 配置加载
 # ============================================================
 
-CONFIG_FILE = Path(__file__).resolve().parent / "configs" / "email_config.json"
-EXAMPLE_FILE = Path(__file__).resolve().parent / "configs" / "email_config.json.example"
+# 项目根目录（本脚本位于 tools/ 下，因此向上一级）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# 默认邮件配置文件（相对项目根目录，不受当前工作目录影响）
+CONFIG_FILE = PROJECT_ROOT / "configs" / "email_config.json"
+EXAMPLE_FILE = PROJECT_ROOT / "configs" / "email_config.json.example"
 
 def load_email_config():
     """从 configs/email_config.json 加载 SMTP 配置"""
     if not CONFIG_FILE.exists():
         print(f"[ERROR] 邮件配置文件不存在: {CONFIG_FILE}")
         print(f"  请复制 {EXAMPLE_FILE} 为 {CONFIG_FILE} 并填写 SMTP 配置")
-        print(f"  示例: cp {EXAMPLE_FILE} {CONFIG_FILE}")
+        print(f"  示例: Copy-Item \"{EXAMPLE_FILE}\" \"{CONFIG_FILE}\"")
         sys.exit(1)
     with open(CONFIG_FILE, encoding='utf-8') as f:
         cfg = json.load(f)
@@ -706,7 +710,9 @@ def main():
     # 加载邮件配置
     global SMTP_CONFIG, CONFIG_FILE
     if args.config:
-        CONFIG_FILE = Path(args.config)
+        # 支持相对/绝对路径，相对路径以当前工作目录为基准
+        CONFIG_FILE = Path(args.config).expanduser().resolve()
+    print(f"  📧 邮件配置: {CONFIG_FILE}")
     SMTP_CONFIG = load_email_config()
     
     if args.interval > 0:
@@ -740,8 +746,8 @@ if __name__ == "__main__":
     print("  TensorBoard 训练监控邮件脚本")
     print("=" * 60)
     print()
-    print(f"  📧 邮件配置: configs/email_config.json")
-    print(f"  📋 参考模板: configs/email_config.json.example")
+    print(f"  📧 邮件配置: {CONFIG_FILE}")
+    print(f"  📋 参考模板: {EXAMPLE_FILE}")
     print(f"  🔒 配置已加入 .gitignore，可安全存放密码")
     print()
     

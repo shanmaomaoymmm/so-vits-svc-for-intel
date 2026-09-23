@@ -38,6 +38,30 @@ from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('numba').setLevel(logging.WARNING)
 
+
+# ---------------------------------------------------------------------------
+# 梯度裁剪监控（节流输出，避免每一步都刷屏）
+# ---------------------------------------------------------------------------
+_GRAD_REPORT = {"last_step": 0, "clip_count": 0, "peak": 0.0, "interval": 1000, "ratio": 10.0}
+
+
+def _report_grad_clip(global_step, grad_norm_before, clip_value):
+    """统计并节流上报梯度裁剪情况：每 interval 步汇总一次，而不是每步打印。"""
+    st = _GRAD_REPORT
+    if grad_norm_before > clip_value * st.get("ratio", 10.0):
+        st["clip_count"] += 1
+        st["peak"] = max(st["peak"], grad_norm_before)
+    span = global_step - st["last_step"]
+    if span >= st["interval"]:
+        if st["clip_count"] > 0:
+            print(f"[GRAD] step {global_step}: clipping active {st['clip_count']}/{span} steps, "
+                  f"peak_before_clip={st['peak']:.1f} (clip={clip_value:g})")
+        else:
+            print(f"[GRAD] step {global_step}: no clipping in last {span} steps (clip={clip_value:g})")
+        st["last_step"] = global_step
+        st["clip_count"] = 0
+        st["peak"] = 0.0
+
 torch.backends.cudnn.benchmark = True
 global_step = 0
 start_time = time.time()
@@ -213,14 +237,26 @@ def run(rank, n_gpus, hps, device_type):
         prefetch_factor = 2
         pin_memory = True  # 启用pin memory加速H2D传输
         persistent_workers = os.name != 'nt'  # Linux下启用persistent workers提高性能
-    
+
+    # 允许通过 config 覆盖数据加载参数（num_workers<0 / null 表示沿用上面的自动策略）
+    _cfg_nw = getattr(hps.train, 'num_workers', -1)
+    if _cfg_nw is not None and int(_cfg_nw) >= 0:
+        num_workers = int(_cfg_nw)
+    _cfg_pin = getattr(hps.train, 'pin_memory', None)
+    if _cfg_pin is not None:
+        pin_memory = bool(_cfg_pin)
+    _cfg_pf = getattr(hps.train, 'prefetch_factor', None)
+    if _cfg_pf is not None:
+        prefetch_factor = int(_cfg_pf)
+    train_shuffle = bool(getattr(hps.train, 'train_shuffle', False))
+
     if rank == 0:
-        print(f"[DEBUG] Creating DataLoader (workers={num_workers})...")
+        print(f"[DEBUG] Creating DataLoader (workers={num_workers}, shuffle={train_shuffle})...")
     # 训练数据加载器配置
     train_loader_kwargs = {
         'dataset': train_dataset,
         'num_workers': num_workers,
-        'shuffle': False,
+        'shuffle': train_shuffle,
         'pin_memory': pin_memory,
         'persistent_workers': persistent_workers if num_workers > 0 else False,
         'batch_size': hps.train.batch_size,
@@ -286,8 +322,11 @@ def run(rank, n_gpus, hps, device_type):
             net_d = DDP(net_d)
     # 如果是单GPU，直接使用原始模型
 
-    skip_optimizer = False
-    skip_optimizer_d = True  # 判别器始终跳过优化器（MSD 参数不匹配）
+    # 续训时是否恢复优化器状态（从 config 读取，避免每次换模型都改代码）
+    skip_optimizer = bool(getattr(hps.train, 'skip_optimizer', False))
+    # 判别器优化器：当 D 为完整 CombinedDiscriminator(MPD+MSD) 且优化器状态与参数一一对应时，
+    # 应保持 false 以恢复 Adam 动量；仅在加载"只含 MPD"的旧检查点时才需置为 true。
+    skip_optimizer_d = bool(getattr(hps.train, 'skip_optimizer_d', False))
 
     # 使用安全加载函数替代原有的加载逻辑
     try:
@@ -338,14 +377,14 @@ def run(rank, n_gpus, hps, device_type):
             print(f"[FIX] Overrode optimizer LR from config: {hps.train.learning_rate}")
 
     warmup_epoch = hps.train.warmup_epochs
-    # 从头训练时，last_epoch 应该为 -1（PyTorch 默认值）
-    scheduler_last_epoch = epoch_str - 2 if epoch_str > 1 else -1
+    # 学习率改为“按训练步衰减”(step-based)：
+    #   每 lr_decay_steps 步将 lr 乘以 gamma(=lr_decay)，在 train_and_evaluate 内按步调用 step()。
+    # ExponentialLR 的 last_epoch 固定为 -1，衰减完全由按步调用控制，
+    # 避免原先“每 epoch 才衰减一次”导致的 12.7 万步仅衰减 3% 的问题。
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=hps.train.lr_decay, last_epoch=scheduler_last_epoch)
-    # 判别器优化器被跳过（skip_optimizer_d=True），此时从 -1 开始
-    scheduler_last_epoch_d = scheduler_last_epoch if not skip_optimizer_d else -1
+        optim_g, gamma=hps.train.lr_decay, last_epoch=-1)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=hps.train.lr_decay, last_epoch=scheduler_last_epoch_d)
+        optim_d, gamma=hps.train.lr_decay, last_epoch=-1)
 
     # ──────────────────────────────────────────────────────────────
     # 修复：消除学习率"过山车"效应
@@ -361,19 +400,16 @@ def run(rank, n_gpus, hps, device_type):
         # learning_rate_g 来自 checkpoint 元数据（保存时的 config LR）
         config_lr_changed = abs(hps.train.learning_rate - learning_rate_g) > 1e-12
         if not config_lr_changed:
-            # config LR 未修改 → 平滑恢复：设置当前 epoch 的正确衰减值
-            # 公式推导：
-            #   scheduler.last_epoch = epoch_str - 2 (line 342)
-            #   下一次 scheduler.step() 会计算：lr = base_lr * gamma^(epoch_str-1)
-            #   这是给 epoch_str+1 用的。当前 epoch (epoch_str) 的 LR 应由
-            #   上一次 step() (在 epoch_str-1 结束时) 设置：
-            #   lr = base_lr * gamma^(epoch_str-2)
-            decay_exponent = max(0, epoch_str - 2)
+            # step-based 衰减：已衰减次数 = global_step // lr_decay_steps
+            lr_decay_steps = int(getattr(hps.train, 'lr_decay_steps', 0) or 0)
+            decay_exponent = (global_step // lr_decay_steps) if lr_decay_steps > 0 else 0
             correct_lr = hps.train.learning_rate * (hps.train.lr_decay ** decay_exponent)
             for param_group in optim_g.param_groups:
                 param_group['lr'] = correct_lr
+            for param_group in optim_d.param_groups:
+                param_group['lr'] = correct_lr
             if rank == 0:
-                print(f"[FIX] Corrected LR for epoch {epoch_str}: "
+                print(f"[FIX] Corrected LR for step {global_step}: "
                       f"{hps.train.learning_rate:.2e} * {hps.train.lr_decay}^{decay_exponent} = {correct_lr:.10f}")
         elif rank == 0:
             print(f"[FIX] Config LR changed ({learning_rate_g:.2e} -> {hps.train.learning_rate:.2e}), "
@@ -411,9 +447,21 @@ def run(rank, n_gpus, hps, device_type):
         else:
             train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler,
                                [train_loader, None], None, None, device_type)
-        # update learning rate
-        scheduler_g.step()
-        scheduler_d.step()
+
+        # 学习率衰减已改为按训练步在 train_and_evaluate 内执行，这里不再按 epoch 衰减。
+        # 达到 max_steps 后停止训练。
+        max_steps = int(getattr(hps.train, 'max_steps', 0) or 0)
+        if max_steps > 0 and global_step >= max_steps:
+            if rank == 0:
+                logger.info(f"====> Reached max_steps={max_steps} (global_step={global_step}). Stop training.")
+                try:
+                    writer.flush()
+                    writer.close()
+                    writer_eval.flush()
+                    writer_eval.close()
+                except Exception as _e:
+                    logger.info(f"[WARN] failed to close writers: {_e}")
+            break
 
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, device_type):
@@ -425,6 +473,13 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         writer, writer_eval = writers
 
     half_type = torch.bfloat16 if hps.train.half_type == "bf16" else torch.float16
+
+    # step-based 学习率衰减与最大训练步数（从 config 读取）
+    lr_decay_steps = int(getattr(hps.train, 'lr_decay_steps', 0) or 0)
+    max_steps = int(getattr(hps.train, 'max_steps', 0) or 0)
+    # 梯度裁剪日志的节流间隔与告警倍数（从 config 读取）
+    _GRAD_REPORT["interval"] = int(getattr(hps.train, 'grad_warn_interval', 1000) or 1000)
+    _GRAD_REPORT["ratio"] = float(getattr(hps.train, 'grad_warn_ratio', 10.0) or 10.0)
     
     # Intel XPU BF16 优化：BF16 不需要 GradScaler（数值范围与FP32相同）
     # BF16: ±3.4×10³⁸ vs FP16: ±6.5×10⁴
@@ -614,11 +669,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 # 再进行实际的梯度裁剪
                 grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), grad_clip_value_g)
                 
-                # 如果梯度过大，输出警告
-                if grad_norm_g_before_clip > grad_clip_value_g * 10:
-                    print(f"[WARNING] Gradient explosion detected! "
-                          f"grad_norm_g: {grad_norm_g_before_clip:.2f} (clipped to {grad_clip_value_g}) "
-                          f"at step {global_step}")
+                # 梯度裁剪监控（节流上报，避免每步刷屏）
+                _report_grad_clip(global_step, float(grad_norm_g_before_clip), float(grad_clip_value_g))
                 scaler.step(optim_g)
                 scaler.update()
             else:
@@ -628,11 +680,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 # 再进行实际的梯度裁剪
                 grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), grad_clip_value_g)
                 
-                # 如果梯度过大，输出警告
-                if grad_norm_g_before_clip > grad_clip_value_g * 10:
-                    print(f"[WARNING] Gradient explosion detected! "
-                          f"grad_norm_g: {grad_norm_g_before_clip:.2f} (clipped to {grad_clip_value_g}) "
-                          f"at step {global_step}")
+                # 梯度裁剪监控（节流上报，避免每步刷屏）
+                _report_grad_clip(global_step, float(grad_norm_g_before_clip), float(grad_clip_value_g))
                 optim_g.step()
             optim_g.zero_grad()
 
@@ -727,6 +776,26 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                         ' [x] NaN loss detected, stopping training')
 
         global_step += 1
+
+        # 按训练步衰减学习率：每 lr_decay_steps 步将 lr 乘以 gamma 一次
+        if lr_decay_steps > 0 and global_step % lr_decay_steps == 0:
+            scheduler_g.step()
+            scheduler_d.step()
+            if rank == 0:
+                logger.info(f"[LR] Step {global_step}: lr decayed to "
+                            f"{optim_g.param_groups[0]['lr']:.3e}")
+
+        # 达到 max_steps 时保存最终检查点并结束本轮（由 run() 的 epoch 循环 break 退出）
+        if max_steps > 0 and global_step >= max_steps:
+            if rank == 0:
+                logger.info(
+                    f"====> Reached max_steps={max_steps}. Saving final checkpoint "
+                    f"G_{global_step}.pth / D_{global_step}.pth")
+                utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
+                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
+                utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
+                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
+            return
 
     if rank == 0:
         global start_time

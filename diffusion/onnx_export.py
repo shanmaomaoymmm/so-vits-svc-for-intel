@@ -163,7 +163,8 @@ class Unit2Mel(nn.Module):
                     "mel2ph": [1],
                     "spk_mix": [0],
                 },
-                opset_version=16
+                opset_version=16,
+                dynamo=False,
             )
         
         self.decoder.OnnxExport(project_name, init_noise=init_noise, export_denoise=export_denoise, export_pred=export_pred, export_after=export_after)
@@ -197,7 +198,8 @@ class Unit2Mel(nn.Module):
                     "volume": [1],
                     "mel2ph": [1]
                 },
-                opset_version=16
+                opset_version=16,
+                dynamo=False,
             )
 
         condition = torch.randn(1,self.decoder.n_hidden,n_frames)
@@ -217,19 +219,35 @@ class Unit2Mel(nn.Module):
                     "condition": [2],
                     "noise": [3],
                 },
-                opset_version=16
+                opset_version=16,
+                dynamo=False,
             )
 
 
 if __name__ == "__main__":
-    project_name = "dddsp"
-    model_path = f'{project_name}/model_500000.pt'
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Diffusion SVC ONNX exporter")
+    parser.add_argument("--project-name", default="dddsp",
+                        help="输出文件前缀（可含目录），生成 <name>_encoder/_denoise/_pred/_after.onnx")
+    parser.add_argument("--model-path", default=None,
+                        help="扩散 checkpoint 路径；同目录下需有 config.yaml（默认 dddsp/model_500000.pt）")
+    parser.add_argument("--out-dir", default="",
+                        help="输出目录（默认当前目录）")
+    parser.add_argument("--merged", action="store_true",
+                        help="导出合并版（<name>_encoder.onnx + <name>_diffusion.onnx）")
+    args = parser.parse_args()
+
+    model_path = args.model_path or f"{args.project_name}/model_500000.pt"
+    project_name = os.path.join(args.out_dir, args.project_name) if args.out_dir else args.project_name
 
     model, _ = load_model_vocoder(model_path)
 
     # 分开Diffusion导出（需要使用MoeSS/MoeVoiceStudio或者自己编写Pndm/Dpm采样）
-    model.OnnxExport(project_name, export_encoder=True, export_denoise=True, export_pred=True, export_after=True)
-
-    # 合并Diffusion导出（Encoder和Diffusion分开，直接将Encoder的结果和初始噪声输入Diffusion即可）
-    # model.ExportOnnx(project_name)
+    if args.merged:
+        # 合并Diffusion导出（Encoder和Diffusion分开，直接将Encoder的结果和初始噪声输入Diffusion即可）
+        model.ExportOnnx(project_name)
+    else:
+        model.OnnxExport(project_name, export_encoder=True, export_denoise=True,
+                         export_pred=True, export_after=True)
 

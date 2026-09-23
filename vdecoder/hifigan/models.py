@@ -135,17 +135,21 @@ class SineGen(torch.nn.Module):
         uv = (f0 > self.voiced_threshold).type(torch.float32)
         return uv
 
-    def _f02sine(self, f0_values):
+    def _f02sine(self, f0_values, rand_ini=None):
         """ f0_values: (batchsize, length, dim)
             where dim indicates fundamental tone and overtones
+
+        rand_ini: 可选外部初相位随机量（ONNX 导出用，避免 trace 固化随机常量）。
         """
         # convert to F0 in rad. The interger part n can be ignored
         # because 2 * np.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
 
         # initial phase noise (no noise for fundamental component)
-        rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], \
-                              device=f0_values.device)
+        if rand_ini is None:
+            rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], \
+                                  device=f0_values.device)
+        rand_ini = rand_ini.clone()
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
 
@@ -194,12 +198,15 @@ class SineGen(torch.nn.Module):
             sines = torch.cos(i_phase * 2 * np.pi)
         return sines
 
-    def forward(self, f0, upp=None):
+    def forward(self, f0, upp=None, rand_ini=None, noise=None):
         """ sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
         output sine_tensor: tensor(batchsize=1, length, dim)
         output uv: tensor(batchsize=1, length, 1)
+
+        rand_ini / noise: 可选外部随机量（用于 ONNX 导出，避免随机算子被 trace 固化为常量）。
+        为 None 时保持原有内部随机行为，训练/推理不受影响。
         """
         if self.onnx:
             with torch.no_grad():
@@ -212,9 +219,11 @@ class SineGen(torch.nn.Module):
                         idx + 2
                     )  # idx + 2: the (idx+1)-th overtone, (idx+2)-th harmonic
                 rad_values = (f0_buf / self.sampling_rate) % 1  ###%1意味着n_har的乘积无法后处理优化
-                rand_ini = torch.rand(
-                    f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device
-                )
+                if rand_ini is None:
+                    rand_ini = torch.rand(
+                        f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device
+                    )
+                rand_ini = rand_ini.clone()
                 rand_ini[:, 0] = 0
                 rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
                 tmp_over_one = torch.cumsum(rad_values, 1)  # % 1  #####%1意味着后面的cumsum无法再优化
@@ -243,16 +252,20 @@ class SineGen(torch.nn.Module):
                     uv.transpose(2, 1), scale_factor=upp, mode="nearest"
                 ).transpose(2, 1)
                 noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-                noise = noise_amp * torch.randn_like(sine_waves)
+                noise = noise_amp * (torch.randn_like(sine_waves) if noise is None
+                                     else noise.to(sine_waves.dtype))
                 sine_waves = sine_waves * uv + noise
             return sine_waves, uv, noise
         else:
             with torch.no_grad():
                 # fundamental component
-                fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+                fn = torch.multiply(
+                    f0,
+                    torch.arange(1, self.harmonic_num + 2,
+                                 device=f0.device, dtype=f0.dtype))
 
                 # generate sine waveforms
-                sine_waves = self._f02sine(fn) * self.sine_amp
+                sine_waves = self._f02sine(fn, rand_ini=rand_ini) * self.sine_amp
 
                 # generate uv signal
                 # uv = torch.ones(f0.shape)
@@ -263,7 +276,8 @@ class SineGen(torch.nn.Module):
                 #        std = self.sine_amp/3 -> max value ~ self.sine_amp
                 # .       for voiced regions is self.noise_std
                 noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-                noise = noise_amp * torch.randn_like(sine_waves)
+                noise = noise_amp * (torch.randn_like(sine_waves) if noise is None
+                                     else noise.to(sine_waves.dtype))
 
                 # first: set the unvoiced part to 0 by uv
                 # then: additive noise
@@ -304,7 +318,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(self, x, upp=None):
+    def forward(self, x, upp=None, rand_ini=None, noise=None):
         """
         Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
         F0_sampled (batchsize, length, 1)
@@ -312,7 +326,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         noise_source (batchsize, length 1)
         """
         # source for harmonic branch
-        sine_wavs, uv, _ = self.l_sin_gen(x, upp)
+        sine_wavs, uv, _ = self.l_sin_gen(x, upp, rand_ini=rand_ini, noise=noise)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs.to(self.l_linear.weight.dtype)))
 
         # source for noise branch, in the same shape as uv
@@ -330,7 +344,9 @@ class Generator(torch.nn.Module):
         self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(h["upsample_rates"]))
         self.m_source = SourceModuleHnNSF(
             sampling_rate=h["sampling_rate"],
-            harmonic_num=16)
+            # harmonic_num 会影响 dec.m_source.l_linear.weight 的形状，
+            # 进而决定与其它 so-vits-svc 权重/项目的兼容性，故改为可由配置控制。
+            harmonic_num=h.get("harmonic_num", 16))
         self.noise_convs = nn.ModuleList()
         self.conv_pre = weight_norm(Conv1d(h["inter_channels"], h["upsample_initial_channel"], 7, 1, padding=3))
         resblock = ResBlock1 if h["resblock"] == '1' else ResBlock2
@@ -363,12 +379,12 @@ class Generator(torch.nn.Module):
         self.onnx = True
         self.m_source.l_sin_gen.onnx = True
 
-    def forward(self, x, f0, g=None):
+    def forward(self, x, f0, g=None, rand_ini=None, noise=None):
         # print(1,x.shape,f0.shape,f0[:, None].shape)
         if not self.onnx:
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         # print(2,f0.shape)
-        har_source, noi_source, uv = self.m_source(f0, self.upp)
+        har_source, noi_source, uv = self.m_source(f0, self.upp, rand_ini=rand_ini, noise=noise)
         har_source = har_source.transpose(1, 2)
         x = self.conv_pre(x)
         x = x + self.cond(g)
