@@ -8,9 +8,10 @@ TensorBoard 训练监控邮件脚本
   pip install matplotlib
 
 使用:
-  python tb_email_monitor.py                    # 立即发送一次
-  python tb_email_monitor.py --interval 3600    # 每 3600 秒发送一次
-  python tb_email_monitor.py --interval 3600 --once  # 发送一次后退出
+  python tb_email_monitor.py                        # 立即发送一次
+  python tb_email_monitor.py --interval 3600        # 每 3600 秒发送一次
+  python tb_email_monitor.py --interval 3600 --once # 发送一次后退出
+  python tb_email_monitor.py --config configs/email_config.json
 
 邮件配置:
   编辑 configs/email_config.json 文件（参照 configs/email_config.json.example）
@@ -18,14 +19,16 @@ TensorBoard 训练监控邮件脚本
 """
 
 import argparse
-import io
 import json
-import os
+import math
 import smtplib
 import sys
 import time
-import urllib.request
+import traceback
 import urllib.error
+import urllib.parse
+import urllib.request
+from email.header import Header
 from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -33,15 +36,31 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from pathlib import Path
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from matplotlib.ticker import MaxNLocator
-except ImportError:
-    print("[ERROR] matplotlib is required. Install with: pip install matplotlib")
-    sys.exit(1)
+# matplotlib 采用延迟导入：只有真正需要绘图时才加载，
+# 这样在未安装 matplotlib 时 `--help` 与配置校验仍可正常工作。
+plt = None
+FuncFormatter = None
+MaxNLocator = None
+
+
+def ensure_matplotlib():
+    """按需导入 matplotlib（Agg 后端，可在无界面环境运行）"""
+    global plt, FuncFormatter, MaxNLocator
+    if plt is not None:
+        return
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt
+        from matplotlib.ticker import FuncFormatter as _FuncFormatter
+        from matplotlib.ticker import MaxNLocator as _MaxNLocator
+    except ImportError:
+        print("[ERROR] matplotlib is required. Install with: pip install matplotlib")
+        sys.exit(1)
+    plt = _plt
+    FuncFormatter = _FuncFormatter
+    MaxNLocator = _MaxNLocator
+
 
 # ============================================================
 # 📋 配置加载
@@ -54,6 +73,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_ROOT / "configs" / "email_config.json"
 EXAMPLE_FILE = PROJECT_ROOT / "configs" / "email_config.json.example"
 
+
 def load_email_config():
     """从 configs/email_config.json 加载 SMTP 配置"""
     if not CONFIG_FILE.exists():
@@ -61,19 +81,45 @@ def load_email_config():
         print(f"  请复制 {EXAMPLE_FILE} 为 {CONFIG_FILE} 并填写 SMTP 配置")
         print(f"  示例: Copy-Item \"{EXAMPLE_FILE}\" \"{CONFIG_FILE}\"")
         sys.exit(1)
-    with open(CONFIG_FILE, encoding='utf-8') as f:
-        cfg = json.load(f)
+
+    try:
+        with open(CONFIG_FILE, encoding='utf-8') as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] 邮件配置文件不是合法的 JSON: {e}")
+        print(f"  编辑文件: {CONFIG_FILE}")
+        sys.exit(1)
+
     required_keys = ["host", "port", "username", "password", "from_addr", "to_addrs"]
     missing = [k for k in required_keys if k not in cfg]
     if missing:
         print(f"[ERROR] 邮件配置缺少必要字段: {missing}")
         sys.exit(1)
+
     # 检查是否还是占位符值
     if "YOUR_" in str(cfg.get("password", "")):
-        print(f"[ERROR] 邮件配置中的 password 仍是占位符值，请填写真实的 SMTP 授权码")
+        print("[ERROR] 邮件配置中的 password 仍是占位符值，请填写真实的 SMTP 授权码")
         print(f"  编辑文件: {CONFIG_FILE}")
         sys.exit(1)
+    if "your_email" in str(cfg.get("username", "")).lower():
+        print("[ERROR] 邮件配置中的 username 仍是占位符值，请填写真实的邮箱账号")
+        print(f"  编辑文件: {CONFIG_FILE}")
+        sys.exit(1)
+
+    to_addrs = cfg.get("to_addrs")
+    if not isinstance(to_addrs, list) or not to_addrs:
+        print("[ERROR] 邮件配置 to_addrs 必须是非空列表，例如: [\"someone@example.com\"]")
+        print(f"  编辑文件: {CONFIG_FILE}")
+        sys.exit(1)
+
+    try:
+        cfg["port"] = int(cfg["port"])
+    except (TypeError, ValueError):
+        print(f"[ERROR] 邮件配置 port 必须是整数，当前为: {cfg.get('port')!r}")
+        sys.exit(1)
+
     return cfg
+
 
 # 全局 SMTP 配置（由 load_email_config() 初始化）
 SMTP_CONFIG = None
@@ -81,9 +127,8 @@ SMTP_CONFIG = None
 # TensorBoard 地址
 TENSORBOARD_URL = "http://127.0.0.1:6006"
 
-# 临时文件目录
-TMP_DIR = Path("tmp")
-TMP_DIR.mkdir(exist_ok=True)
+# 临时文件目录（固定在项目根目录下，不受当前工作目录影响）
+TMP_DIR = PROJECT_ROOT / "tmp"
 
 
 # ============================================================
@@ -118,22 +163,29 @@ def tb_request_binary(path):
 
 def get_scalar_data(tag, run="."):
     """获取标量数据，返回 [(step, value, wall_time), ...]"""
-    raw = tb_request(f"/data/plugin/scalars/scalars?tag={urllib.parse.quote(tag)}&run={urllib.parse.quote(run)}")
+    raw = tb_request(
+        f"/data/plugin/scalars/scalars?tag={urllib.parse.quote(tag)}"
+        f"&run={urllib.parse.quote(run)}"
+    )
     data = json.loads(raw)
-    return [(item[1], item[2], item[0]) for item in data]  # (step, value, wall_time)
+    # TensorBoard 返回 [wall_time, step, value]
+    return [(item[1], item[2], item[0]) for item in data]
 
 
 def get_latest_audio(tag, run="eval"):
     """获取最新的音频数据，返回 (step, wav_bytes) 或 None"""
-    raw = tb_request(f"/data/plugin/audio/audio?tag={urllib.parse.quote(tag)}&run={urllib.parse.quote(run)}")
+    raw = tb_request(
+        f"/data/plugin/audio/audio?tag={urllib.parse.quote(tag)}"
+        f"&run={urllib.parse.quote(run)}"
+    )
     items = json.loads(raw)
     if not items:
         return None
-    
+
     # 找到 step 最大的（最新的）
-    latest = max(items, key=lambda x: x['step'])
+    latest = max(items, key=lambda x: x.get('step', 0))
     step = latest['step']
-    
+
     # 下载音频 - query 是完整查询参数，直接拼接
     query = latest.get('query', '')
     if query:
@@ -142,28 +194,31 @@ def get_latest_audio(tag, run="eval"):
             return (step, wav_data)
         except Exception as e:
             print(f"     音频下载失败: {e}")
-    
+
     return (step, None)
 
 
 def get_latest_image(tag, run="."):
     """获取最新的图片，返回 (step, png_bytes) 或 None"""
-    raw = tb_request(f"/data/plugin/images/images?tag={urllib.parse.quote(tag)}&run={urllib.parse.quote(run)}")
+    raw = tb_request(
+        f"/data/plugin/images/images?tag={urllib.parse.quote(tag)}"
+        f"&run={urllib.parse.quote(run)}"
+    )
     items = json.loads(raw)
     if not items:
         return None
-    
-    latest = max(items, key=lambda x: x['step'])
+
+    latest = max(items, key=lambda x: x.get('step', 0))
     step = latest['step']
-    
+
     query = latest.get('query', '')
     if query:
         try:
             img_data = tb_request_binary(f"/data/plugin/images/image?{query}")
             return (step, img_data)
-        except:
-            pass
-    
+        except Exception as e:
+            print(f"     图片下载失败: {e}")
+
     return (step, None)
 
 
@@ -179,6 +234,23 @@ def get_audio_tags():
     return json.loads(raw)
 
 
+def get_default_run():
+    """获取默认的 run 名称（TensorBoard 中通常为 '.'）"""
+    try:
+        tags = get_scalar_tags()
+        if isinstance(tags, dict) and tags:
+            return sorted(tags.keys())[0]
+    except Exception as e:
+        print(f"    ~ 获取 run 列表失败，回退为 '.': {e}")
+    return "."
+
+
+def safe_filename(name):
+    """将文件名转成纯 ASCII，避免邮件头编码/客户端乱码问题"""
+    ascii_name = name.encode('ascii', 'ignore').decode('ascii').strip()
+    return ascii_name or "attachment.bin"
+
+
 # ============================================================
 # 📊 图表生成
 # ============================================================
@@ -192,6 +264,7 @@ PLOT_STYLE = {
     'lines.linewidth': 1.5,
 }
 
+
 def make_scalar_chart(data_triples, title, ylabel, filename, log_scale=False):
     """
     生成标量曲线图 — TensorBoard Time Series 风格
@@ -199,17 +272,25 @@ def make_scalar_chart(data_triples, title, ylabel, filename, log_scale=False):
     - X轴为 Step
     - 底部显示累计训练时间
     """
+    ensure_matplotlib()
     plt.rcParams.update(PLOT_STYLE)
-    fig, ax = plt.subplots(figsize=(12, 4.2))
-    
+
+    # 过滤无效值（NaN / Inf），避免图表与统计异常
+    data_triples = [
+        p for p in data_triples
+        if isinstance(p[1], (int, float)) and math.isfinite(p[1])
+    ]
     if not data_triples:
+        print(f"    ~ 跳过图表 {title}: 无有效数据")
         return
-    
+
+    fig, ax = plt.subplots(figsize=(12, 4.2))
+
     steps = [p[0] for p in data_triples]
     values = [p[1] for p in data_triples]
     wall_times = [p[2] for p in data_triples]
     x_data = steps
-    
+
     # ====== 计算平滑线 ======
     if len(values) > 30:
         window = max(3, len(values) // 100)
@@ -220,7 +301,7 @@ def make_scalar_chart(data_triples, title, ylabel, filename, log_scale=False):
             smoothed.append(sum(values[start:end]) / (end - start))
     else:
         smoothed = values
-    
+
     # ====== 绘制：原始散点 + 平滑线 ======
     # 原始数据：半透明蓝线 + 散点
     ax.plot(x_data, values, color='#2196F3', linewidth=0.6, alpha=0.25, zorder=1)
@@ -229,62 +310,64 @@ def make_scalar_chart(data_triples, title, ylabel, filename, log_scale=False):
                color='#2196F3', alpha=0.35, zorder=2, marker='.', linewidths=0)
     # 平滑线：橙色（用户喜欢的配色）
     ax.plot(x_data, smoothed, color='#FF5722', linewidth=2.2, alpha=0.9, zorder=3)
-    
+
     # ====== Y轴范围：基于平滑数据（尖峰溢出） ======
     if not log_scale:
         s_min, s_max = min(smoothed), max(smoothed)
         if s_max > s_min:
             margin = (s_max - s_min) * 0.15
             ax.set_ylim(max(0, s_min - margin), s_max + margin)
-    
+
     # ====== 右下角最新值标注 ======
     latest_val = values[-1]
     min_val = min(values)
     max_val = max(values)
-    
-    ax.annotate(f'{latest_val:.4f}', xy=(x_data[-1], smoothed[-1]),
+
+    ax.annotate(f'{latest_val:.4f}', xy=(x_data[-1], latest_val),
                 xytext=(10, 0), textcoords='offset points',
                 fontsize=11, fontfamily='monospace', color='#D32F2F', fontweight='bold',
                 va='center',
                 arrowprops=dict(arrowstyle='-', color='#D32F2F', lw=1.0))
-    
+
     # ====== 底部信息栏（含累计训练时间） ======
     start_wt = wall_times[0]
-    total_sec = wall_times[-1] - start_wt
+    total_sec = max(0.0, wall_times[-1] - start_wt)
     total_h = total_sec / 3600.0
     if total_h > 24:
         time_str = f'{total_h/24:.1f}d'
     else:
         time_str = f'{total_h:.1f}h'
-    
+
     info_text = (f'Time {time_str}  |  '
                  f'Step {int(steps[-1])}  |  '
                  f'Latest: {latest_val:.4f}  |  '
                  f'Min: {min_val:.4f}  |  '
                  f'Max: {max_val:.4f}')
-    
+
     ax.text(0.5, -0.28, info_text, transform=ax.transAxes,
             fontsize=9, fontfamily='monospace', color='#666',
             va='top', ha='center',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#fafafa', edgecolor='#e0e0e0', lw=0.8))
-    
+
     # ====== 格式化 ======
     ax.set_title(title, fontsize=12, fontweight='bold', pad=8)
     ax.set_xlabel('Step', fontsize=10, color='#555')
     ax.set_ylabel(ylabel, fontsize=10, color='#555')
-    
+
     if log_scale:
         ax.set_yscale('log')
-    
+
     ax.grid(True, alpha=0.2, color='#ccc', linestyle='-')
     ax.set_axisbelow(True)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x/1000)}k' if x >= 1000 else f'{int(x)}'))
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(lambda x, p: f'{int(x/1000)}k' if x >= 1000 else f'{int(x)}')
+    )
     ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_color('#ddd')
     ax.spines['bottom'].set_color('#ddd')
-    
+
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.18)
     fig.savefig(filename, dpi=100, bbox_inches='tight', format='jpeg')
@@ -300,11 +383,11 @@ def generate_all_charts():
     返回 [(group_name, tag, filepath), ...]
     """
     chart_files = []
-    tags = get_scalar_tags()
-    run = list(tags.keys())[0] if tags else "."
-    
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    run = get_default_run()
+
     print("  [获取标量数据]")
-    
+
     data_cache = {}
     needed_tags = [
         "grad_norm_g", "grad_norm_d",
@@ -321,7 +404,7 @@ def generate_all_charts():
                 print(f"    ✗ {tag} (no data)")
         except Exception as e:
             print(f"    ✗ {tag} ({e})")
-    
+
     # ====== 组1: 梯度 ======
     print("  [生成] 梯度组...")
     grad_map = {
@@ -332,64 +415,70 @@ def generate_all_charts():
         if tag in data_cache:
             filename = TMP_DIR / f"chart_{tag.replace('/', '_')}.jpg"
             make_scalar_chart(data_cache[tag], title, "Gradient Norm", filename, log_s)
-            chart_files.append(("gradient", tag, filename))
-            print(f"    ✓ {tag}")
-    
+            if filename.exists():
+                chart_files.append(("gradient", tag, filename))
+                print(f"    ✓ {tag}")
+
     # ====== 组2: 学习率 ======
     print("  [生成] 学习率图...")
     if "learning_rate" in data_cache:
         filename = TMP_DIR / "chart_learning_rate.jpg"
         make_scalar_chart(data_cache["learning_rate"], "Learning Rate", "LR", filename)
-        chart_files.append(("lr", "learning_rate", filename))
-        print("    ✓ learning_rate")
-    
+        if filename.exists():
+            chart_files.append(("lr", "learning_rate", filename))
+            print("    ✓ learning_rate")
+
     # ====== 组3: 损失 ======
     print("  [生成] 损失组...")
     loss_map = {
-        "loss/g/total": ("Generator Total Loss", False),
-        "loss/g/mel": ("Generator Mel Loss", False),
-        "loss/g/fm": ("Generator FM Loss", False),
-        "loss/g/kl": ("Generator KL Loss", False),
-        "loss/d/total": ("Discriminator Total Loss", False),
+        "loss/g/total": "Generator Total Loss",
+        "loss/g/mel": "Generator Mel Loss",
+        "loss/g/fm": "Generator FM Loss",
+        "loss/g/kl": "Generator KL Loss",
+        "loss/d/total": "Discriminator Total Loss",
     }
-    for tag, (title, _) in loss_map.items():
+    for tag, title in loss_map.items():
         if tag in data_cache:
             filename = TMP_DIR / f"chart_{tag.replace('/', '_')}.jpg"
             make_scalar_chart(data_cache[tag], title, "Loss", filename)
-            chart_files.append(("loss", tag, filename))
-            print(f"    ✓ {tag}")
-    
+            if filename.exists():
+                chart_files.append(("loss", tag, filename))
+                print(f"    ✓ {tag}")
+
     return chart_files
 
 
 def generate_latest_values_table():
     """生成最新数值的 HTML 表格"""
-    tags = get_scalar_tags()
-    run = list(tags.keys())[0] if tags else "."
-    
+    run = get_default_run()
+
     metrics = [
         "loss/g/total", "loss/g/mel", "loss/g/fm", "loss/g/kl",
         "loss/d/total", "learning_rate",
         "grad_norm_g", "grad_norm_d",
     ]
-    
+
     rows = []
     for tag in metrics:
         try:
             data = get_scalar_data(tag, run)
+            data = [
+                (s, v, w) for s, v, w in data
+                if isinstance(v, (int, float)) and math.isfinite(v)
+            ]
             if data:
                 latest_step, latest_val, _ = data[-1]
                 # 取最近 100 个点的均值
                 recent = data[-min(100, len(data)):]
                 avg_val = sum(v for _, v, _ in recent) / len(recent)
-                
+
                 # 取整体范围
                 all_vals = [v for _, v, _ in data]
                 min_val, max_val = min(all_vals), max(all_vals)
-                
+
                 name = tag.replace("loss/g/", "G ").replace("loss/d/", "D ")
                 name = name.replace("_", " ").title()
-                
+
                 rows.append(f"""
                 <tr>
                     <td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:500;">{name}</td>
@@ -410,7 +499,7 @@ def generate_latest_values_table():
                 <td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:500;">{tag}</td>
                 <td colspan="4" style="padding:6px 10px;border-bottom:1px solid #eee;color:#f00;">Error: {e}</td>
             </tr>""")
-    
+
     return "\n".join(rows)
 
 
@@ -421,22 +510,30 @@ def generate_latest_values_table():
 def download_latest_audio():
     """下载最新的 gen 音频，返回 [(tag, step, wav_path), ...]"""
     audio_files = []
-    tags_info = get_audio_tags()
-    
-    if "eval" not in tags_info:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        tags_info = get_audio_tags()
+    except Exception as e:
+        print(f"  ✗ 获取音频标签失败: {e}")
+        return audio_files
+
+    if not isinstance(tags_info, dict) or "eval" not in tags_info:
         print("  ✗ 没有 eval 音频数据")
         return audio_files
-    
+
     gen_tags = [t for t in tags_info["eval"].keys() if t.startswith("gen/")]
     gen_tags.sort()
-    
+
     print(f"  [音频] 获取最新的生成音频 ({len(gen_tags)} 个)...")
     for tag in gen_tags:
         try:
             result = get_latest_audio(tag, "eval")
             if result and result[1]:
                 step, wav_data = result
-                filename = TMP_DIR / f"audio_{tag.replace('/', '_')}_step{step}.wav"
+                filename = TMP_DIR / safe_filename(
+                    f"audio_{tag.replace('/', '_')}_step{step}.wav"
+                )
                 with open(filename, 'wb') as f:
                     f.write(wav_data)
                 audio_files.append((tag, step, filename))
@@ -447,7 +544,7 @@ def download_latest_audio():
                 print(f"    ✗ {tag} (无数据)")
         except Exception as e:
             print(f"    ✗ {tag} ({e})")
-    
+
     return audio_files
 
 
@@ -455,17 +552,18 @@ def download_latest_audio():
 # 📧 邮件发送
 # ============================================================
 
-def send_email(chart_files, latest_table, error_msg=None):
+def send_email(chart_files, latest_table, error_msg=None, audio_files=None):
     """发送邮件报告"""
     global SMTP_CONFIG
     if SMTP_CONFIG is None:
         SMTP_CONFIG = load_email_config()
     cfg = SMTP_CONFIG
-    
+    audio_files = audio_files or []
+
     # ========== 1. 构建 HTML 正文 ==========
     html_img_tags = []  # 收集 img 标签，稍后插入
     html_parts = []
-    
+
     html_parts.append(f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -499,10 +597,10 @@ td.num {{ text-align: right; font-family: 'Courier New', monospace; }}
     <p>生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | Step: {get_current_step()}</p>
 </div>
 """)
-    
+
     if error_msg:
         html_parts.append(f'<div class="error">⚠️ {error_msg}</div>')
-    
+
     # 数值表格
     html_parts.append("""
 <div class="section">
@@ -524,43 +622,54 @@ td.num {{ text-align: right; font-family: 'Courier New', monospace; }}
 </table>
 </div>
 """)
-    
+
     # 图表区域 - 分三组
     group_names = {
         "gradient": "📊 梯度",
         "lr": "🎯 学习率",
         "loss": "📉 损失",
     }
-    
+
+    name_map = {
+        "grad_norm_g": "Generator 梯度范数",
+        "grad_norm_d": "Discriminator 梯度范数",
+        "learning_rate": "学习率",
+        "loss/g/total": "Generator 总损失",
+        "loss/g/mel": "Generator Mel 损失",
+        "loss/g/fm": "Generator FM 损失",
+        "loss/g/kl": "Generator KL 损失",
+        "loss/d/total": "Discriminator 总损失",
+    }
+
     for group_key in ["gradient", "lr", "loss"]:
         group_items = [c for c in chart_files if c[0] == group_key]
         if not group_items:
             continue
-        
+
         html_parts.append(f"""
 <div class="section">
 <h2>{group_names[group_key]}</h2>
 """)
-        for group, tag, filepath in group_items:
+        for _group, tag, filepath in group_items:
             if filepath.exists():
                 img_cid = f"chart_{tag.replace('/', '_')}"
                 html_img_tags.append((img_cid, filepath))
-                # 友好的显示名称
-                name_map = {
-                    "grad_norm_g": "Generator 梯度范数",
-                    "grad_norm_d": "Discriminator 梯度范数",
-                    "learning_rate": "学习率",
-                    "loss/g/total": "Generator 总损失",
-                    "loss/g/mel": "Generator Mel 损失",
-                    "loss/g/fm": "Generator FM 损失",
-                    "loss/g/kl": "Generator KL 损失",
-                    "loss/d/total": "Discriminator 总损失",
-                }
                 display_name = name_map.get(tag, tag)
                 html_parts.append(f'<p style="margin:14px 0 4px;font-weight:600;font-size:14px;">{display_name}</p>')
                 html_parts.append(f'<img src="cid:{img_cid}" class="chart-img" alt="{display_name}">')
         html_parts.append("</div>")
-    
+
+    # 音频附件说明
+    if audio_files:
+        html_parts.append("""
+<div class="section">
+<h2>🔊 音频附件</h2>
+<ul style="font-size:13px;color:#555;padding-left:20px;">
+""")
+        for tag, step, _fp in audio_files:
+            html_parts.append(f'<li>{tag} (step {step})</li>')
+        html_parts.append('</ul><p class="audio-info">音频以附件形式附带，可下载试听（邮件中的音频不内嵌播放）。</p></div>')
+
     html_parts.append(f"""
 <div class="footer">
 <p>So-VITS Training Monitor | <a href="{TENSORBOARD_URL}">{TENSORBOARD_URL}</a></p>
@@ -570,30 +679,53 @@ td.num {{ text-align: right; font-family: 'Courier New', monospace; }}
 </body>
 </html>
 """)
-    
+
     html_content = "\n".join(html_parts)
-    
+
     # ========== 2. 构建 MIME 消息 ==========
     # multipart/related: 第一部分必须是根文档(HTML)，后面是嵌入资源(图片)
-    msg = MIMEMultipart('related')
-    msg['Subject'] = "[So-VITS 训练报告]"
-    msg['From'] = cfg['from_addr']
-    msg['To'] = ', '.join(cfg['to_addrs'])
-    msg['Date'] = formatdate(localtime=True)
-    
+    related = MIMEMultipart('related')
+
     # 【关键】HTML 必须是 multipart/related 的第一个部分
-    msg.attach(MIMEText(html_content, 'html', 'utf-8'))
-    
+    related.attach(MIMEText(html_content, 'html', 'utf-8'))
+
     # 然后在 HTML 之后附加图片（通过 cid: 引用）
     for img_cid, filepath in html_img_tags:
-        with open(filepath, 'rb') as f:
-            img_data = f.read()
+        try:
+            with open(filepath, 'rb') as f:
+                img_data = f.read()
+        except OSError as e:
+            print(f"    ✗ 读取图表失败 {filepath}: {e}")
+            continue
         img_part = MIMEImage(img_data, _subtype='jpeg')
         img_part.add_header('Content-ID', f'<{img_cid}>')
         img_part.add_header('Content-Disposition', 'inline')
         # 不设置 filename 参数，避免邮件客户端误识别为附件
-        msg.attach(img_part)
-    
+        related.attach(img_part)
+
+    # 有音频时用 multipart/mixed 包裹 related + 音频附件
+    if audio_files:
+        msg = MIMEMultipart('mixed')
+        msg.attach(related)
+        for tag, step, filepath in audio_files:
+            try:
+                with open(filepath, 'rb') as f:
+                    wav_data = f.read()
+            except OSError as e:
+                print(f"    ✗ 读取音频失败 {filepath}: {e}")
+                continue
+            fname = safe_filename(f"{tag.replace('/', '_')}_step{step}.wav")
+            part = MIMEApplication(wav_data, _subtype='x-wav')
+            part.add_header('Content-Disposition', 'attachment', filename=fname)
+            msg.attach(part)
+    else:
+        msg = related
+
+    msg['Subject'] = Header("[So-VITS 训练报告]", 'utf-8')
+    msg['From'] = cfg['from_addr']
+    msg['To'] = ', '.join(cfg['to_addrs'])
+    msg['Date'] = formatdate(localtime=True)
+
     # ========== 3. 发送 ==========
     print(f"\n  📧 发送邮件到 {', '.join(cfg['to_addrs'])}...")
     try:
@@ -602,9 +734,9 @@ td.num {{ text-align: right; font-family: 'Courier New', monospace; }}
         else:
             server = smtplib.SMTP(cfg['host'], cfg['port'], timeout=30)
             server.starttls()
-        
+
         server.login(cfg['username'], cfg['password'])
-        server.sendmail(cfg['from_addr'], cfg['to_addrs'], msg.as_string())
+        server.sendmail(cfg['from_addr'], cfg['to_addrs'], msg.as_bytes())
         server.quit()
         print("  ✓ 邮件发送成功")
         return True
@@ -625,10 +757,10 @@ td.num {{ text-align: right; font-family: 'Courier New', monospace; }}
 def get_current_step():
     """获取当前训练步数"""
     try:
-        data = get_scalar_data("loss/g/total", ".")
+        data = get_scalar_data("loss/g/total", get_default_run())
         if data:
             return int(data[-1][0])
-    except:
+    except Exception:
         pass
     return "?"
 
@@ -640,17 +772,17 @@ def get_current_step():
 def send_report():
     """执行一次完整的报告发送"""
     print("=" * 60)
-    print(f"  TensorBoard 训练监控报告")
+    print("  TensorBoard 训练监控报告")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  TensorBoard: {TENSORBOARD_URL}")
     print("=" * 60)
-    
+
     error_msg = None
-    
+
     # 1. 检查 TensorBoard 连接
     print("\n[1/4] 检查 TensorBoard 连接...")
     try:
-        test = tb_request("/data/plugin/scalars/tags")
+        tb_request("/data/plugin/scalars/tags")
         print("  ✓ TensorBoard 连接正常")
     except ConnectionError as e:
         print(f"  ✗ {e}")
@@ -659,42 +791,54 @@ def send_report():
     except Exception as e:
         print(f"  ✗ 未知错误: {e}")
         error_msg = f"❌ 连接 TensorBoard 时发生未知错误: {e}"
-    
+
     if error_msg:
         # 发送错误通知邮件
         latest_table = "<tr><td colspan='5' style='color:#f00;text-align:center;'>无法获取数据</td></tr>"
-        send_email([], [], latest_table, error_msg)
+        send_email([], latest_table, error_msg)
         return
-    
+
+    chart_files = []
+    audio_files = []
     try:
         # 2. 获取标量数据并生成图表
         print("\n[2/4] 生成训练曲线图表...")
         chart_files = generate_all_charts()
-        
+
         # 3. 获取最新数值表格
         print("\n[3/4] 生成最新指标表格...")
         latest_table = generate_latest_values_table()
-        
+
+        # 3.1 获取最新生成音频（作为附件）
+        audio_files = download_latest_audio()
+
         # 4. 发送邮件
         print("\n[4/4] 发送邮件...")
-        send_email(chart_files, latest_table)
-        
-        # 清理临时文件
+        ok = send_email(chart_files, latest_table, audio_files=audio_files)
+
+        print("\n" + "=" * 60)
+        if ok:
+            print("  ✅ 报告完成")
+        else:
+            print("  ⚠️ 报告生成完成，但邮件发送失败（详见上方错误信息）")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\n  ❌ 生成报告时出错: {e}")
+        traceback.print_exc()
+    finally:
+        # 清理临时文件（无论成功失败都清理，避免长期运行堆积）
         print("\n[清理] 删除临时文件...")
         for _, _, fp in chart_files:
             try:
                 fp.unlink(missing_ok=True)
-            except:
+            except OSError:
                 pass
-        
-        print("\n" + "=" * 60)
-        print("  ✅ 报告完成")
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"\n  ❌ 生成报告时出错: {e}")
-        import traceback
-        traceback.print_exc()
+        for _, _, fp in audio_files:
+            try:
+                fp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def main():
@@ -706,15 +850,23 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="邮件配置文件路径（默认: configs/email_config.json）")
     args = parser.parse_args()
-    
+
     # 加载邮件配置
     global SMTP_CONFIG, CONFIG_FILE
     if args.config:
         # 支持相对/绝对路径，相对路径以当前工作目录为基准
         CONFIG_FILE = Path(args.config).expanduser().resolve()
+
+    print("=" * 60)
+    print("  TensorBoard 训练监控邮件脚本")
+    print("=" * 60)
     print(f"  📧 邮件配置: {CONFIG_FILE}")
+    print(f"  📋 参考模板: {EXAMPLE_FILE}")
+    print(f"  🔒 配置已加入 .gitignore，可安全存放密码")
+    print()
+
     SMTP_CONFIG = load_email_config()
-    
+
     if args.interval > 0:
         print(f"🕐 监控模式：每 {args.interval} 秒发送一次报告")
         count = 0
@@ -727,28 +879,21 @@ def main():
                 send_report()
             except Exception as e:
                 print(f"  ❌ 发送报告时崩溃: {e}")
-                import traceback
                 traceback.print_exc()
-            
+
             if args.once:
                 print("\n  --once 模式，退出。")
                 break
-            
+
             print(f"\n⏳ 等待 {args.interval} 秒后下一次报告...")
-            print(f"   按 Ctrl+C 退出\n")
+            print("   按 Ctrl+C 退出\n")
             time.sleep(args.interval)
     else:
         send_report()
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  TensorBoard 训练监控邮件脚本")
-    print("=" * 60)
-    print()
-    print(f"  📧 邮件配置: {CONFIG_FILE}")
-    print(f"  📋 参考模板: {EXAMPLE_FILE}")
-    print(f"  🔒 配置已加入 .gitignore，可安全存放密码")
-    print()
-    
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  ⏹️ 已手动终止监控。")

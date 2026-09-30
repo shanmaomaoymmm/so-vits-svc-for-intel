@@ -177,6 +177,50 @@ def analyze_http(host, run, tags):
 # --------------------------------------------------------------------------
 # 3) 候选 checkpoint 指标对比
 # --------------------------------------------------------------------------
+def analyze_phase(host, run, tag, periods):
+    """按 step % PERIOD 分组统计曲线均值，用于发现周期性波动（如与 lr 衰减/epoch 对齐）。"""
+    pts = _fetch_scalars(host, run, tag)
+    if len(pts) < 20:
+        print(f"\n[{tag}] 点数不足，无法做相位分析")
+        return
+    s_min, s_max = pts[0][0], pts[-1][0]
+    cut = s_min + (s_max - s_min) * 0.1  # 跳过早期剧烈下降段
+    used = [(s, v) for s, v in pts if s > cut]
+    print(f"=== {tag} 相位分析（step > {int(cut)}，共 {len(used)} 点）===")
+    print(f"  说明: spread 越大，说明该周期越明显\n")
+    for P in periods:
+        g = {}
+        for s, v in used:
+            g.setdefault(s % P, []).append(v)
+        means = {k: sum(v) / len(v) for k, v in g.items()}
+        spread = max(means.values()) - min(means.values())
+        print(f"period {P:>6}: spread={spread:.4f}")
+        print("   " + "  ".join(f"{k}:{means[k]:.3f}" for k in sorted(means)))
+
+
+def analyze_jumps(host, run, tag, top=15):
+    """显示某条曲线相邻两点的最大上升/下降跳变，并附带该处 learning_rate，用于诊断"重启跳变"。"""
+    pts = _fetch_scalars(host, run, tag)
+    if len(pts) < 2:
+        print(f"\n[{tag}] 点数不足，无法分析跳变")
+        return
+    diffs = [(pts[i + 1][1] - pts[i][1], pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+             for i in range(len(pts) - 1)]
+    lr_map = {}
+    try:
+        lr_map = dict(_fetch_scalars(host, run, "learning_rate"))
+    except Exception:
+        pass
+
+    print(f"=== {tag}: 最大上升跳变 (top {top}) ===")
+    for d, s1, v1, s2, v2 in sorted(diffs, reverse=True)[:top]:
+        lr_txt = f"  lr: {lr_map.get(s1)} -> {lr_map.get(s2)}" if lr_map else ""
+        print(f"  step {s1:>7} -> {s2:>7}: {v1:8.4f} -> {v2:8.4f}  (+{d:.4f}){lr_txt}")
+    print(f"\n=== {tag}: 最大下降跳变 (top {top}) ===")
+    for d, s1, v1, s2, v2 in sorted(diffs)[:top]:
+        print(f"  step {s1:>7} -> {s2:>7}: {v1:8.4f} -> {v2:8.4f}  ({d:.4f})")
+
+
 def compare_candidates(host, run, steps, tags=None):
     tags = tags or CANDIDATE_TAGS
     print(f"host={host}  run={run}")
@@ -287,7 +331,21 @@ def main():
                     help="逗号分隔的 step 列表，输出候选 checkpoint 指标对比")
     ap.add_argument("--diffusion-log", default=None,
                     help=f"解析扩散训练日志（默认 {DEFAULT_DIFFUSION_LOG}）")
+    ap.add_argument("--jumps", default=None,
+                    help="分析指定 tag 的最大上升/下降跳变点（诊断重启跳变），如 loss/g/kl")
+    ap.add_argument("--phase", default=None,
+                    help="按 step%%PERIOD 分组统计（逗号分隔多个周期），如 200,500,1000,2000")
+    ap.add_argument("--phase-tag", default="loss/g/kl", help="相位分析的 tag（默认 loss/g/kl）")
     args = ap.parse_args()
+
+    if args.phase:
+        periods = [int(x) for x in args.phase.split(",") if x.strip()]
+        analyze_phase(args.http or DEFAULT_HTTP, args.run, args.phase_tag, periods)
+        return
+
+    if args.jumps:
+        analyze_jumps(args.http or DEFAULT_HTTP, args.run, args.jumps)
+        return
 
     if args.diffusion_log is not None:
         path = args.diffusion_log or DEFAULT_DIFFUSION_LOG
